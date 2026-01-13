@@ -27,9 +27,10 @@ NOMINATIM_BASE = "https://nominatim.openstreetmap.org"
 # --- Simulation core ---
 # sim_core.py is expected to be present in the same service.
 try:
-    from sim_core import simulate_annual_output  # type: ignore
+    from sim_core import simulate_annual_output, water_metrics_from_shading_samples  # type: ignore
 except Exception as e:  # pragma: no cover
     simulate_annual_output = None  # type: ignore
+    water_metrics_from_shading_samples = None  # type: ignore
     _SIM_IMPORT_ERROR = str(e)
 
 
@@ -137,7 +138,7 @@ def reverse_geocode(lat: float = Query(...), lon: float = Query(...)) -> Dict[st
 
 
 def _ensure_sim_core() -> None:
-    if simulate_annual_output is None:
+    if simulate_annual_output is None or water_metrics_from_shading_samples is None:
         raise HTTPException(
             status_code=500,
             detail=f"Simulation core not available. Import error: {_SIM_IMPORT_ERROR}",
@@ -302,9 +303,31 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
     svf = float(req.svf)
     effective = max(0.0, min(1.0, svf * tau_mean))
 
+    # Water-plane metrics expected by the frontend
+    year_int = int(req.year) if req.year is not None else None
+    # Default to 2024 if year not provided (last full year), keeps results deterministic.
+    if year_int is None:
+        year_int = 2024
+
+    wm = water_metrics_from_shading_samples(
+        latitude=float(req.lat),
+        longitude=float(req.lon),
+        year=year_int,
+        samples=[s.model_dump() for s in (req.shading_samples or [])],
+        svf=svf,
+    )
+
     return {
-        "annual_energy_kwh": annual * effective,
-        "mean_poa_w_m2": mean_poa * effective,
+        # PV energy/POA should come from the PV model (base) and should not be scaled by water SVF/tau.
+        "annual_energy_kwh": annual,
+        "mean_poa_w_m2": mean_poa,
+
+        # Water metrics used for savings scaling in water mode
+        "water_baseline_kwh_m2": float(wm.get("water_baseline_kwh_m2", 0.0)),
+        "water_shaded_kwh_m2": float(wm.get("water_shaded_kwh_m2", 0.0)),
+        "water_reduction_pct": float(wm.get("water_reduction_pct", 0.0)),
+
+        # Debug shading fields
         "shading": {
             "svf": svf,
             "tau_mean": tau_mean,
