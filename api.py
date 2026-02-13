@@ -27,10 +27,21 @@ NOMINATIM_BASE = "https://nominatim.openstreetmap.org"
 # --- Simulation core ---
 # sim_core.py is expected to be present in the same service.
 try:
-    from sim_core import simulate_annual_output, water_metrics_from_shading_samples  # type: ignore
+    from sim_core import (
+        simulate_annual_output,
+        water_metrics_from_shading_samples,
+        get_meteo_timeseries,
+        annual_climate_means,
+        infer_wind_block_factor,
+        water_evaporation_lpy_from_kwh_m2,
+    )  # type: ignore
 except Exception as e:  # pragma: no cover
     simulate_annual_output = None  # type: ignore
     water_metrics_from_shading_samples = None  # type: ignore
+    get_meteo_timeseries = None  # type: ignore
+    annual_climate_means = None  # type: ignore
+    infer_wind_block_factor = None  # type: ignore
+    water_evaporation_lpy_from_kwh_m2 = None  # type: ignore
     _SIM_IMPORT_ERROR = str(e)
 
 
@@ -57,6 +68,14 @@ class SimRequest(BaseModel):
 
     # Water surface (only relevant for water mode)
     water_width_m: Optional[float] = Field(default=None)
+
+    # Water evaporation model inputs (optional; used for Ladybug-aligned water savings)
+    height_m: Optional[float] = Field(default=None, description="Height of array above water surface (m)")
+    water_area_m2: Optional[float] = Field(default=None, description="Water surface area considered (m^2)")
+    use_penman: Optional[bool] = Field(default=True, description="Use modified Penman-style radiation model")
+    K_evap: Optional[float] = Field(default=None, description="Empirical evaporation coefficient K (e.g., 0.15 in report)")
+    lambda_evap_mj_per_kg: Optional[float] = Field(default=None, description="Latent heat lambda in MJ/kg (default 2.45)")
+    wind_block_factor: Optional[float] = Field(default=None, description="Wind blocking factor (0..1); 1 = open water")
 
 
 class ShadingSample(BaseModel):
@@ -138,7 +157,14 @@ def reverse_geocode(lat: float = Query(...), lon: float = Query(...)) -> Dict[st
 
 
 def _ensure_sim_core() -> None:
-    if simulate_annual_output is None or water_metrics_from_shading_samples is None:
+    if (
+        simulate_annual_output is None
+        or water_metrics_from_shading_samples is None
+        or get_meteo_timeseries is None
+        or annual_climate_means is None
+        or infer_wind_block_factor is None
+        or water_evaporation_lpy_from_kwh_m2 is None
+    ):
         raise HTTPException(
             status_code=500,
             detail=f"Simulation core not available. Import error: {_SIM_IMPORT_ERROR}",
@@ -152,11 +178,21 @@ def _compute_panel_area_m2(req: SimRequest) -> float:
 def _compute_orientation_buckets(req: SimRequest) -> Dict[str, Any]:
     """Map frontend array_type to (surface_azimuths_deg, panels_per_azimuth).
 
-    - Roof: single orientation at req.azimuth_deg
-    - Waves: alternating +/- 90° about req.azimuth_deg (simplified, representative)
+    Conventions:
+      - Frontend/UI azimuth: 0=N, 90=E, 180=S, 270=W.
+
+    Buckets:
+      - Roof/canopy: single orientation at req.azimuth_deg
+      - Waves: two opposing faces (az and az+180). This matches a V/accordion
+        cross-section better than +/-90 (perpendicular faces).
     """
     at = (req.array_type or "waves").strip().lower()
-    az = float(req.azimuth_deg)
+
+    def wrap360(deg: float) -> float:
+        d = float(deg) % 360.0
+        return d if d >= 0 else d + 360.0
+
+    az = wrap360(req.azimuth_deg)
 
     if at in ("roof", "solar_roof", "canopy", "solar_canopy"):
         return {"surface_azimuths_deg": [az], "panels_per_azimuth": [int(req.total_panels)]}
@@ -166,7 +202,11 @@ def _compute_orientation_buckets(req: SimRequest) -> Dict[str, Any]:
     n = int(req.total_panels)
     n1 = (n + 1) // 2
     n2 = n - n1
-    return {"surface_azimuths_deg": [az - 90.0, az + 90.0], "panels_per_azimuth": [n1, n2]}
+
+    a0 = az
+    a1 = az + 180.0
+    return {"surface_azimuths_deg": [a0, a1], "panels_per_azimuth": [n1, n2]}
+
 
 
 @app.post("/simulate")
@@ -175,6 +215,7 @@ def simulate(req: SimRequest) -> Dict[str, Any]:
     _ensure_sim_core()
 
     buckets = _compute_orientation_buckets(req)
+    print("[AZ BUCKETS]", buckets)
 
     out = simulate_annual_output(
         latitude=float(req.lat),
@@ -213,6 +254,7 @@ def simulate_snapshot_day(req: SimRequest) -> Dict[str, Any]:
     _ensure_sim_core()
 
     buckets = _compute_orientation_buckets(req)
+    print("[AZ BUCKETS]", buckets)
 
     # Run the same annual model and reuse mean POA as a proxy for daily mean POA.
     # Keep arguments aligned with SimRequest fields to avoid runtime AttributeErrors.
@@ -241,6 +283,16 @@ def simulate_snapshot_day(req: SimRequest) -> Dict[str, Any]:
         return f"{az_r:.1f}|{t_r:.1f}"
 
     orientations = []
+
+    print("[AZ INPUT]", {
+        "ui_azimuth_deg": float(req.azimuth_deg),
+        "surface_azimuths_deg": list(buckets["surface_azimuths_deg"]),
+        "panels_per_azimuth": list(buckets["panels_per_azimuth"]),
+        "tilt_deg": float(req.tilt_deg),
+        "array_type": req.array_type,
+    })
+
+
     for az_deg, n in zip(buckets["surface_azimuths_deg"], buckets["panels_per_azimuth"]):
         orientations.append(
             {
@@ -317,6 +369,58 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
         svf=svf,
     )
 
+    # --- Ladybug-aligned evaporation model (liters/year) ---
+    water_area_m2 = float(req.water_area_m2) if req.water_area_m2 is not None else 0.0
+    # If not provided, we cannot compute absolute liters/year; percentages still returned.
+    if water_area_m2 < 0:
+        water_area_m2 = 0.0
+
+    ts_w = get_meteo_timeseries(latitude=float(req.lat), longitude=float(req.lon), year=year_int)
+    clim = annual_climate_means(ts_w)
+    Tavg_C = float(clim.get("Tavg_C", 0.0))
+    RH_dec = float(clim.get("RH_dec", 0.0))
+    Wavg_m_s = float(clim.get("Wavg_m_s", 0.0))
+
+    K_evap = float(req.K_evap) if req.K_evap is not None else 0.15
+    lam_evap = float(req.lambda_evap_mj_per_kg) if req.lambda_evap_mj_per_kg is not None else 2.45
+    use_penman = bool(req.use_penman) if req.use_penman is not None else True
+
+    # Wind exposure factors (1 = fully exposed open water)
+    wind_factor_uncovered = 1.0
+    wind_factor_covered = (
+        float(req.wind_block_factor)
+        if req.wind_block_factor is not None
+        else infer_wind_block_factor(array_type=req.array_type, height_m=req.height_m)
+    )
+
+    evap_uncovered = water_evaporation_lpy_from_kwh_m2(
+        water_kwh_m2_yr=float(wm.get("water_baseline_kwh_m2", 0.0)),
+        water_area_m2=water_area_m2,
+        Tavg_C=Tavg_C,
+        RH_dec=RH_dec,
+        Wavg_m_s=Wavg_m_s,
+        K=K_evap,
+        lambda_MJ_per_kg=lam_evap,
+        use_penman=use_penman,
+        wind_block_factor=wind_factor_uncovered,
+    )
+    evap_covered = water_evaporation_lpy_from_kwh_m2(
+        water_kwh_m2_yr=float(wm.get("water_shaded_kwh_m2", 0.0)),
+        water_area_m2=water_area_m2,
+        Tavg_C=Tavg_C,
+        RH_dec=RH_dec,
+        Wavg_m_s=Wavg_m_s,
+        K=K_evap,
+        lambda_MJ_per_kg=lam_evap,
+        use_penman=use_penman,
+        wind_block_factor=wind_factor_covered,
+    )
+
+    evap_uncovered_lpy = float(evap_uncovered.get("evap_lpy_wind", 0.0))
+    evap_covered_lpy = float(evap_covered.get("evap_lpy_wind", 0.0))
+    water_saved_lpy = max(0.0, evap_uncovered_lpy - evap_covered_lpy)
+    water_saved_pct = 0.0 if evap_uncovered_lpy <= 1e-9 else (100.0 * water_saved_lpy / evap_uncovered_lpy)
+
     return {
         # PV energy/POA should come from the PV model (base) and should not be scaled by water SVF/tau.
         "annual_energy_kwh": annual,
@@ -326,6 +430,25 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
         "water_baseline_kwh_m2": float(wm.get("water_baseline_kwh_m2", 0.0)),
         "water_shaded_kwh_m2": float(wm.get("water_shaded_kwh_m2", 0.0)),
         "water_reduction_pct": float(wm.get("water_reduction_pct", 0.0)),
+
+        # Ladybug-aligned evaporation outputs (liters/year)
+        "water_area_m2": float(water_area_m2),
+        "evap_uncovered_lpy": float(evap_uncovered_lpy),
+        "evap_covered_lpy": float(evap_covered_lpy),
+        "water_saved_lpy": float(water_saved_lpy),
+        "water_saved_pct": float(water_saved_pct),
+        "evap_model": {
+            "use_penman": bool(use_penman),
+            "K": float(K_evap),
+            "lambda_MJ_per_kg": float(lam_evap),
+            "Tavg_C": float(Tavg_C),
+            "RH_dec": float(RH_dec),
+            "Wavg_m_s": float(Wavg_m_s),
+            "wind_block_factor_uncovered": float(wind_factor_uncovered),
+            "wind_block_factor_covered": float(wind_factor_covered),
+            "R_uncovered_MJ_m2_yr": float(evap_uncovered.get("R_MJ_m2_yr", 0.0)),
+            "R_covered_MJ_m2_yr": float(evap_covered.get("R_MJ_m2_yr", 0.0)),
+        },
 
         # Debug shading fields
         "shading": {

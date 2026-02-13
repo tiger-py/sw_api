@@ -5,6 +5,7 @@ from typing import Dict, List, Sequence, Tuple
 import datetime as dt
 import math
 import time
+import os
 
 import requests
 
@@ -248,27 +249,23 @@ class TiltedTimeseries:
     count: int
     monthly_poa_sum_wm2: Dict[str, float]  # "YYYY-MM" -> sum of W/m² over all hours in that month
 
-def _normalize_azimuth_deg(deg: float) -> float:
+def _normalize_azimuth_deg(deg_ui: float) -> float:
     """
-    Map any azimuth in degrees to the range [-180, 180].
+    Convert UI azimuth (0=N,90=E,180=S,270=W) into Open-Meteo azimuth
+    where 0=S, -90=E, +90=W, ±180=N, and clamp to [-180, 180).
 
-    UI slider uses 0°=N, 90°=E, 180°=S, 270°=W, 360°=N.
-    Open-Meteo requires azimuth in [-180, 180], same reference.
-
-    Examples:
-      0   ->   0
-      90  ->  90
-      180 -> 180
-      270 -> -90
-      210 -> -150
-      -190 -> 170
+    Mapping:
+      UI 180 (South) -> 0
+      UI  90 (East)  -> -90
+      UI 270 (West)  -> +90
+      UI   0 (North) -> -180 (or +180)
     """
-    # Wrap into [0, 360)
-    d = float(deg) % 360.0
-    # Shift to [-180, 180)
+    # shift UI so that South becomes 0 (Open-Meteo convention)
+    d = (float(deg_ui) - 180.0) % 360.0
     if d > 180.0:
         d -= 360.0
     return d
+
 
 def _round_coord(x: float, digits: int = 3) -> float:
     return float(round(x, digits))
@@ -460,6 +457,16 @@ def simulate_annual_output(
         # into the -180…+180° azimuth expected by Open-Meteo.
         az_norm = _normalize_azimuth_deg(float(az_deg))
 
+        if os.environ.get("SW_DEBUG_AZ", "") == "1":
+            print("[POA QUERY]", {
+                "lat": float(latitude),
+                "lon": float(longitude),
+                "tilt_deg": float(surface_tilt_deg),
+                "ui_or_model_az_deg": float(az_deg),
+                "openmeteo_az_deg": float(az_norm),
+                "n_panels": int(n_panels),
+            })
+
         ts = _fetch_tilted_timeseries(
             latitude=latitude,
             longitude=longitude,
@@ -531,6 +538,148 @@ def _nearest_time_index(times: Sequence[dt.datetime], target: dt.datetime) -> in
     return i0 if (target - times[i0]) <= (times[i1] - target) else i1
 
 
+
+# ============================================================
+# Water evaporation model helpers (Ladybug-aligned)
+# ============================================================
+
+def annual_climate_means(ts: MeteoTimeseries) -> Dict[str, float]:
+    """Return annual mean climate drivers from the Open-Meteo hourly series.
+
+    Returns:
+        dict with keys: Tavg_C, RH_dec, Wavg_m_s
+    """
+    def _safe_mean(arr: List[float]) -> float:
+        vals = [float(v) for v in arr if v is not None]
+        return float(sum(vals) / len(vals)) if vals else 0.0
+
+    tavg = _safe_mean(ts.tair_c)
+    rh = _safe_mean(ts.rh_pct) / 100.0
+    wavg = _safe_mean(ts.wind_m_s)
+    rh = max(0.0, min(1.0, rh))
+    return {"Tavg_C": tavg, "RH_dec": rh, "Wavg_m_s": wavg}
+
+
+def evap_mm_from_radiation(
+    *,
+    R_MJ_m2_yr: float,
+    Tavg_C: float,
+    RH_dec: float,
+    K: float,
+    lambda_MJ_per_kg: float = 2.45,
+    use_penman: bool = True,
+) -> float:
+    """Estimate annual evaporation depth (mm/year) from annual shortwave radiation.
+
+    Ladybug/PDF-inspired form:
+      E = (K * R * (1 + 0.537*T)) / lambda * (1 - RH)
+
+    Where:
+      - R is MJ/m²/year
+      - lambda is MJ/kg (≈ MJ per mm·m² of evaporation)
+      - RH is 0..1
+    """
+    R = max(0.0, float(R_MJ_m2_yr))
+    T = float(Tavg_C)
+    RH = max(0.0, min(1.0, float(RH_dec)))
+    lam = float(lambda_MJ_per_kg) if lambda_MJ_per_kg else 2.45
+    if lam <= 0:
+        lam = 2.45
+
+    if use_penman:
+        E = (float(K) * R * (1.0 + 0.537 * T)) / lam * (1.0 - RH)
+    else:
+        E = (float(K) * R) / lam
+    return float(max(0.0, E))
+
+
+def apply_wind_correction(*, E_mm_yr: float, Wavg_m_s: float, wind_block_factor: float) -> float:
+    """Apply the PDF wind correction: E_adj = E * (1 + (W * f)/5)."""
+    E = max(0.0, float(E_mm_yr))
+    W = max(0.0, float(Wavg_m_s))
+    f = max(0.0, min(1.0, float(wind_block_factor)))
+    WB = W * f
+    return float(E * (1.0 + WB / 5.0))
+
+
+def infer_wind_block_factor(*, array_type: str, height_m: float | None) -> float:
+    """Heuristic wind exposure factor (0..1), where 1 means fully exposed to wind."""
+    h = float(height_m) if height_m is not None and math.isfinite(height_m) else None
+
+    at = (array_type or "").lower()
+    if at not in ("waves", "roof"):
+        at = "waves"
+
+    if h is None:
+        return 0.2 if at == "waves" else 0.8
+
+    def lerp(a: float, b: float, t: float) -> float:
+        return a + t * (b - a)
+
+    def clamp01(x: float) -> float:
+        return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+    if at == "waves":
+        # Stage 1: 0.3m -> 5m : 0.10 -> 0.60
+        # Stage 2: 5m  -> 12m: 0.60 -> 1.00
+        if h <= 5.0:
+            h0, h1 = 0.3, 5.0
+            t = clamp01((h - h0) / (h1 - h0))
+            return float(lerp(0.10, 0.60, t))
+        else:
+            h0, h1 = 5.0, 12.0
+            t = clamp01((h - h0) / (h1 - h0))
+            return float(lerp(0.60, 1.00, t))
+
+    else:
+        # roof/canopy: more exposed at all heights
+        # Stage 1: 0.5m -> 6m  : 0.40 -> 0.90
+        # Stage 2: 6m  -> 12m : 0.90 -> 1.00
+        if h <= 6.0:
+            h0, h1 = 0.5, 6.0
+            t = clamp01((h - h0) / (h1 - h0))
+            return float(lerp(0.40, 0.90, t))
+        else:
+            h0, h1 = 6.0, 12.0
+            t = clamp01((h - h0) / (h1 - h0))
+            return float(lerp(0.90, 1.00, t))
+
+
+
+def water_evaporation_lpy_from_kwh_m2(
+    *,
+    water_kwh_m2_yr: float,
+    water_area_m2: float,
+    Tavg_C: float,
+    RH_dec: float,
+    Wavg_m_s: float,
+    K: float = 0.15,
+    lambda_MJ_per_kg: float = 2.45,
+    use_penman: bool = True,
+    wind_block_factor: float = 1.0,
+) -> Dict[str, float]:
+    """Compute liters/year evaporation over a water area given annual shortwave (kWh/m²).
+
+    Returns dict: evap_mm_yr, evap_lpy, R_MJ_m2_yr, evap_mm_wind_yr, evap_lpy_wind
+    """
+    kwh = max(0.0, float(water_kwh_m2_yr))
+    area = max(0.0, float(water_area_m2))
+    R = kwh * 3.6  # MJ/m²/year
+    E_mm = evap_mm_from_radiation(R_MJ_m2_yr=R, Tavg_C=Tavg_C, RH_dec=RH_dec, K=K,
+                                  lambda_MJ_per_kg=lambda_MJ_per_kg, use_penman=use_penman)
+    E_mm_w = apply_wind_correction(E_mm_yr=E_mm, Wavg_m_s=Wavg_m_s, wind_block_factor=wind_block_factor)
+    evap_lpy = E_mm * area
+    evap_lpy_w = E_mm_w * area
+    return {
+        "R_MJ_m2_yr": float(R),
+        "evap_mm_yr": float(E_mm),
+        "evap_lpy": float(evap_lpy),
+        "evap_mm_wind_yr": float(E_mm_w),
+        "evap_lpy_wind": float(evap_lpy_w),
+    }
+
+
+
 def water_metrics_from_shading_samples(
     *,
     latitude: float,
@@ -539,9 +688,54 @@ def water_metrics_from_shading_samples(
     samples: Sequence[dict],
     svf: float = 1.0,
 ) -> Dict[str, float]:
+    """Estimate annual shortwave energy on water for baseline vs shaded cases.
+
+    IMPORTANT:
+      - This function supports two regimes:
+        (A) **Representative-day sampling** (recommended): if a sample has weight_hours >= ~24,
+            we interpret the sample's timestamp as a representative UTC day and integrate
+            *all 24 hourly bins for that day* from Open-Meteo. The sample weight is then
+            treated as (days_in_month * 24), so we multiply the daily energy by (weight_hours/24).
+        (B) Legacy **single-hour sampling**: if weight_hours < 24, we treat it as a single
+            hourly bin with that weight in hours (previous behavior).
+
+    Returns:
+      water_baseline_kwh_m2: annual baseline shortwave [kWh/m^2/yr]
+      water_shaded_kwh_m2: annual shaded shortwave [kWh/m^2/yr]
+      water_reduction_pct: percent reduction from baseline to shaded [%]
+    """
     ts = get_meteo_timeseries(latitude=latitude, longitude=longitude, year=year)
     if not ts.times_utc:
         return {"water_baseline_kwh_m2": 0.0, "water_shaded_kwh_m2": 0.0, "water_reduction_pct": 0.0}
+
+    svf_clamped = max(0.0, min(1.0, float(svf)))
+
+    # Precompute per-UTC-day direct/diffuse energy [kWh/m^2/day] for the location.
+    # This avoids the "noon irradiance * 24" overcount problem while keeping the payload small.
+    day_energy: Dict[dt.date, Tuple[float, float]] = {}
+    for i, t_utc in enumerate(ts.times_utc):
+        dni = ts.dni_w_m2[i]
+        dhi = ts.dhi_w_m2[i]
+        if dni is None or dhi is None:
+            continue
+        try:
+            zen, _az = solar_position_approx_utc(t_utc=t_utc, latitude=latitude, longitude=longitude)
+        except Exception:
+            continue
+        if zen >= math.pi / 2:
+            # sun below horizon -> contribution ~0
+            continue
+        cosz = max(0.0, math.cos(zen))
+        # Convert W/m^2 over one hour -> kWh/m^2 (divide by 1000)
+        direct_kwh = float(dni) * cosz / 1000.0
+        diffuse_kwh = float(dhi) / 1000.0
+
+        d = t_utc.date()
+        if d in day_energy:
+            dd, df = day_energy[d]
+            day_energy[d] = (dd + direct_kwh, df + diffuse_kwh)
+        else:
+            day_energy[d] = (direct_kwh, diffuse_kwh)
 
     baseline = 0.0
     shaded = 0.0
@@ -551,10 +745,12 @@ def water_metrics_from_shading_samples(
             continue
         t = s.get("time_utc") or s.get("t_utc") or s.get("time")
         tau = float(s.get("tau", 1.0))
+        tau = max(0.0, min(1.0, tau))
         wh = float(s.get("weight_hours", 0.0))
         if wh <= 0:
             continue
 
+        # Parse sample time
         t_dt = None
         if isinstance(t, dt.datetime):
             t_dt = t
@@ -568,21 +764,46 @@ def water_metrics_from_shading_samples(
         if t_dt.tzinfo is not None:
             t_dt = t_dt.astimezone(dt.timezone.utc).replace(tzinfo=None)
 
+        # Regime (A): representative-day integration
+        if wh >= 23.5:
+            d = t_dt.date()
+            dd_df = day_energy.get(d)
+            if dd_df is None:
+                # fall back to nearest-hour sampling
+                i = _nearest_time_index(ts.times_utc, t_dt)
+                dni = ts.dni_w_m2[i]
+                dhi = ts.dhi_w_m2[i]
+                if dni is None or dhi is None:
+                    continue
+                zen, _az = solar_position_approx_utc(t_utc=ts.times_utc[i], latitude=latitude, longitude=longitude)
+                if zen >= math.pi / 2:
+                    continue
+                cosz = max(0.0, math.cos(zen))
+                i0 = float(dni) * cosz + float(dhi)
+                i1 = float(dni) * cosz * tau + float(dhi) * svf_clamped
+                baseline += i0 * wh / 1000.0
+                shaded += i1 * wh / 1000.0
+                continue
+
+            direct_kwh_day, diffuse_kwh_day = dd_df
+            # weight_hours is expected to be days*24 for monthly sampling; multiply by (wh/24) days
+            days = wh / 24.0
+            baseline += (direct_kwh_day + diffuse_kwh_day) * days
+            shaded += (direct_kwh_day * tau + diffuse_kwh_day * svf_clamped) * days
+            continue
+
+        # Regime (B): legacy single-hour weighted sampling
         i = _nearest_time_index(ts.times_utc, t_dt)
         dni = ts.dni_w_m2[i]
         dhi = ts.dhi_w_m2[i]
         if dni is None or dhi is None:
             continue
-
         zen, _az = solar_position_approx_utc(t_utc=ts.times_utc[i], latitude=latitude, longitude=longitude)
         if zen >= math.pi / 2:
             continue
         cosz = max(0.0, math.cos(zen))
-
         i0 = float(dni) * cosz + float(dhi)
-        svf_clamped = max(0.0, min(1.0, float(svf)))
-        i1 = float(dni) * cosz * max(0.0, min(1.0, tau)) + float(dhi) * svf_clamped
-
+        i1 = float(dni) * cosz * tau + float(dhi) * svf_clamped
         baseline += i0 * wh / 1000.0
         shaded += i1 * wh / 1000.0
 
