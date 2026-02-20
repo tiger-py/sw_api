@@ -20,14 +20,14 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://solarsim-frontend.pages.dev",
+        "https://tiger-py.github.io",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Use a real contact email/URL for Nominatim usage policy compliance
-# IMPORTANT: Replace contact@example.com with your email or domain.
 HEADERS = {"User-Agent": "SolarWaves/1.0 (contact@example.com)"}
 
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
