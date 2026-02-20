@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Any
 import datetime as dt
 import math
 import time
@@ -48,6 +48,8 @@ class MeteoTimeseries:
 
 _METEO_CACHE: Dict[Tuple[float, float, int], MeteoTimeseries] = {}
 
+# Daily precipitation cache: (lat, lon, year) -> list[mm/day]
+_PRECIP_CACHE: Dict[Tuple[float, float, int], List[float]] = {}
 
 def get_meteo_timeseries(*, latitude: float, longitude: float, year: int) -> MeteoTimeseries:
     """Fetch hourly GHI/DNI/DHI + basic meteo from Open-Meteo.
@@ -233,6 +235,13 @@ def solar_position_approx_utc(*, t_utc: dt.datetime, latitude: float, longitude:
 
     return zen, az
 
+def _wrap_deg_180(az_deg: float) -> float:
+    """Wrap degrees to (-180, 180]."""
+    a = float(az_deg) % 360.0
+    if a > 180.0:
+        a -= 360.0
+    return a
+
 @dataclass
 class TiltedTimeseries:
     """
@@ -384,6 +393,50 @@ def _fetch_tilted_timeseries(
         raise last_exc
     raise OpenMeteoError(f"Open-Meteo unreachable: {type(last_exc).__name__}: {last_exc}")
 
+def debug_compare_openmeteo_azimuth_conventions(*, latitude: float, longitude: float, tilt_deg: float, year: int) -> Dict[str, float]:
+    """
+    Compare annual POA sums for the SAME physical orientations using two azimuth conventions:
+      A) passthrough: assumes Open-Meteo expects 0=N,90=E,180=S,270=W
+      B) normalized:  assumes Open-Meteo expects 0=S, -90=E, +90=W, ±180=N  (your _normalize_azimuth_deg)
+    Returns annual kWh/m^2 proxies (sum(W/m²)/1000).
+    """
+    def annual_kwh_m2(az_for_query: float) -> float:
+        ts = _fetch_tilted_timeseries(
+            latitude=latitude,
+            longitude=longitude,
+            tilt_deg=float(tilt_deg),
+            azimuth_deg=_wrap_deg_180(float(az_for_query)),
+            year=int(year),
+        )
+        return float(ts.total_poa_sum_wm2) / 1000.0
+
+    # UI meanings
+    ui_north = 0.0
+    ui_south = 180.0
+    ui_east  = 90.0
+    ui_west  = 270.0
+
+    # Convention A: pass-through
+    A = {
+        "A_pass_north": annual_kwh_m2(ui_north),
+        "A_pass_south": annual_kwh_m2(ui_south),
+        "A_pass_east":  annual_kwh_m2(ui_east),
+        "A_pass_west":  annual_kwh_m2(ui_west),
+    }
+
+    # Convention B: your normalization
+    B = {
+        "B_norm_north": annual_kwh_m2(_normalize_azimuth_deg(ui_north)),
+        "B_norm_south": annual_kwh_m2(_normalize_azimuth_deg(ui_south)),
+        "B_norm_east":  annual_kwh_m2(_normalize_azimuth_deg(ui_east)),
+        "B_norm_west":  annual_kwh_m2(_normalize_azimuth_deg(ui_west)),
+    }
+
+    out = {}
+    out.update(A)
+    out.update(B)
+    return out
+
 
 def get_tilted_timeseries(
     *,
@@ -509,6 +562,89 @@ def simulate_annual_output(
         "annual_energy_kwh": float(total_annual_energy_kwh),
         "monthly_energy_kwh": {k: float(v) for k, v in monthly_energy_kwh_sorted.items()},
         "mean_poa_w_m2": float(mean_poa_w_m2),
+    }
+
+def _parse_month_key_from_time_utc(time_utc: str) -> str | None:
+    if not time_utc or len(time_utc) < 7:
+        return None
+    try:
+        return time_utc[0:7]
+    except Exception:
+        return None
+
+def pv_energy_from_tau_samples(*, base: Dict[str, object], pv_samples: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    monthly_energy = base.get("monthly_energy_kwh", {}) or {}
+    if not isinstance(monthly_energy, dict):
+        monthly_energy = {}
+
+    tau_wsum: Dict[str, float] = {}
+    tau_tsum: Dict[str, float] = {}
+
+    wsum_all = 0.0
+    tsum_all = 0.0
+
+    for s in (pv_samples or []):
+        try:
+            time_utc = str(s.get("time_utc", ""))
+
+            # Correct priority:
+            #   1) tau_shadow (pure shading mask)
+            #   2) tau (legacy)
+            #   3) f_beam (incidence-weighted availability) only if nothing else exists
+            tau_raw = s.get("tau_shadow", None)
+            if tau_raw is None:
+                tau_raw = s.get("tau", None)
+            if tau_raw is None:
+                tau_raw = s.get("f_beam", 1.0)
+
+            tau = float(tau_raw)
+            w = float(s.get("weight_hours", 0.0))
+        except Exception:
+            continue
+
+        if w <= 0:
+            continue
+
+        tau = max(0.0, min(1.0, tau))
+        mk = _parse_month_key_from_time_utc(time_utc)
+        if not mk:
+            continue
+
+        tau_wsum[mk] = tau_wsum.get(mk, 0.0) + w
+        tau_tsum[mk] = tau_tsum.get(mk, 0.0) + w * tau
+
+        wsum_all += w
+        tsum_all += w * tau
+
+    tau_pv_monthly: Dict[str, float] = {}
+    for mk, wsum in tau_wsum.items():
+        if wsum > 0:
+            tau_pv_monthly[mk] = tau_tsum.get(mk, 0.0) / wsum
+
+    tau_pv_mean = (tsum_all / wsum_all) if wsum_all > 0 else 1.0
+    tau_pv_mean = max(0.0, min(1.0, tau_pv_mean))
+
+    monthly_shaded: Dict[str, float] = {}
+    annual_shaded = 0.0
+
+    for mk, e in monthly_energy.items():
+        try:
+            e0 = float(e)
+        except Exception:
+            continue
+
+        tau_m = tau_pv_monthly.get(mk, tau_pv_mean)
+        tau_m = max(0.0, min(1.0, tau_m))
+
+        e1 = e0 * tau_m
+        monthly_shaded[mk] = float(e1)
+        annual_shaded += float(e1)
+
+    return {
+        "annual_energy_kwh_shaded_pv": float(annual_shaded),
+        "monthly_energy_kwh_shaded_pv": dict(sorted(monthly_shaded.items())),
+        "tau_pv_mean": float(tau_pv_mean),
+        "tau_pv_monthly": dict(sorted(tau_pv_monthly.items())),
     }
 
 
@@ -812,4 +948,130 @@ def water_metrics_from_shading_samples(
         "water_baseline_kwh_m2": float(baseline),
         "water_shaded_kwh_m2": float(shaded),
         "water_reduction_pct": float(red),
+    }
+
+
+# ============================================================
+# Rainwater collection (Solar Waves)
+# ============================================================
+
+def get_openmeteo_daily_precipitation_sum_mm(*, latitude: float, longitude: float, year: int) -> List[float]:
+    """Fetch daily precipitation_sum (mm/day) for a full calendar year from Open-Meteo archive/forecast.
+
+    Returns a list of daily precipitation sums in mm. Length is typically 365 or 366.
+
+    Notes:
+      - Uses the archive endpoint first; falls back to forecast if needed.
+      - Cached in-process by (rounded lat, rounded lon, year).
+    """
+    key = (_round_coord(latitude), _round_coord(longitude), int(year))
+    if key in _PRECIP_CACHE:
+        return _PRECIP_CACHE[key]
+
+    start_date = f"{int(year)}-01-01"
+    end_date = f"{int(year)}-12-31"
+
+    url_archive = "https://archive-api.open-meteo.com/v1/archive"
+    url_forecast = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "precipitation_sum",
+        "timezone": "UTC",
+    }
+
+    last_exc = None
+    last_status = None
+    last_text = None
+    data = None
+    for url in (url_archive, url_forecast):
+        try:
+            r = requests.get(url, params=params, timeout=60)
+        except Exception as e:
+            last_exc = e
+            continue
+
+        if r.status_code == 200:
+            data = r.json()
+            break
+
+        last_status = r.status_code
+        last_text = (r.text or "")[:200]
+
+        if url == url_forecast and r.status_code == 400:
+            continue
+
+    if data is None:
+        if last_exc is not None:
+            raise OpenMeteoError(f"Open-Meteo unreachable: {type(last_exc).__name__}: {last_exc}")
+        raise OpenMeteoError(f"Open-Meteo error {last_status}: {last_text}")
+
+    daily = data.get("daily") or {}
+    precip = daily.get("precipitation_sum") or []
+    out: List[float] = [float(x or 0.0) for x in precip]
+
+    _PRECIP_CACHE[key] = out
+    return out
+
+
+
+def annual_rainwater_collection(
+    *,
+    latitude: float,
+    longitude: float,
+    year: int,
+    total_panels: int,
+    panel_width_m: float,
+    panel_height_m: float,
+    tilt_deg: float,
+    eta: float = 0.80,
+    coverage: float = 1.00,
+) -> Dict[str, float]:
+    """Estimate annual rainwater collection for Solar Waves (m^3 and liters).
+
+    Model (V1):
+      AnnualCollected_m3 = (AnnualRainfall_mm/1000) * A_catch_m2 * eta * coverage
+
+      A_slope_m2 = total_panels * (panel_width_m * panel_height_m)
+      A_catch_m2 = A_slope_m2 * cos(tilt_rad)
+
+    - Rainfall is assumed vertical; therefore use horizontal projection (plan catchment).
+    - eta bundles runoff + gutter capture + losses.
+    - coverage can optionally derate for gaps/edge effects.
+    """
+    if total_panels <= 0:
+        return {
+            "annual_rainfall_mm": 0.0,
+            "a_slope_m2": 0.0,
+            "a_catch_m2": 0.0,
+            "eta": float(eta),
+            "coverage": float(coverage),
+            "water_collected_m3": 0.0,
+            "water_collected_liters": 0.0,
+        }
+
+    precip_mm = get_openmeteo_daily_precipitation_sum_mm(latitude=latitude, longitude=longitude, year=year)
+    annual_rainfall_mm = float(sum(precip_mm))
+
+    a_panel = float(panel_width_m) * float(panel_height_m)
+    a_slope = float(total_panels) * a_panel
+
+    tilt_rad = math.radians(float(tilt_deg))
+    a_catch = a_slope * math.cos(tilt_rad)
+    if a_catch < 0.0:
+        a_catch = 0.0
+
+    water_m3 = (annual_rainfall_mm / 1000.0) * a_catch * float(eta) * float(coverage)
+    water_liters = water_m3 * 1000.0
+
+    return {
+        "annual_rainfall_mm": annual_rainfall_mm,
+        "a_slope_m2": a_slope,
+        "a_catch_m2": a_catch,
+        "eta": float(eta),
+        "coverage": float(coverage),
+        "water_collected_m3": float(water_m3),
+        "water_collected_liters": float(water_liters),
     }

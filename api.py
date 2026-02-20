@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import datetime as dt
+
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sim_core import pv_energy_from_tau_samples
 import requests
+from sim_core import debug_compare_openmeteo_azimuth_conventions
+from fastapi import Query
 
 
 app = FastAPI(title="Solar Output API", version="0.5.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,6 +43,7 @@ try:
         annual_climate_means,
         infer_wind_block_factor,
         water_evaporation_lpy_from_kwh_m2,
+        annual_rainwater_collection,
     )  # type: ignore
 except Exception as e:  # pragma: no cover
     simulate_annual_output = None  # type: ignore
@@ -42,6 +52,7 @@ except Exception as e:  # pragma: no cover
     annual_climate_means = None  # type: ignore
     infer_wind_block_factor = None  # type: ignore
     water_evaporation_lpy_from_kwh_m2 = None  # type: ignore
+    annual_rainwater_collection = None  # type: ignore
     _SIM_IMPORT_ERROR = str(e)
 
 
@@ -80,8 +91,25 @@ class SimRequest(BaseModel):
 
 class ShadingSample(BaseModel):
     time_utc: str
-    tau: float = Field(ge=0.0, le=1.0)
+
+    # Backward-compatible (old frontend)
+    tau: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    # New frontend fields (optional)
+    tau_shadow: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    f_beam: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
     weight_hours: float = Field(gt=0.0)
+
+    def pv_factor(self) -> float:
+        if self.f_beam is not None:
+             return float(self.f_beam)
+        if self.tau_shadow is not None:
+             return float(self.tau_shadow)
+        if self.tau is not None:
+            return float(self.tau)
+        return 1.0
+
 
 
 class SimShadedRequest(SimRequest):
@@ -90,6 +118,7 @@ class SimShadedRequest(SimRequest):
     svf_n_rays: Optional[int] = None
     svf_scheme: Optional[str] = None
     shading_samples: List[ShadingSample] = Field(default_factory=list)
+    pv_shading_samples: List[ShadingSample] = Field(default_factory=list)
 
 
 def _open_meteo_geocode(q: str, count: int = 5) -> Dict[str, Any]:
@@ -207,7 +236,19 @@ def _compute_orientation_buckets(req: SimRequest) -> Dict[str, Any]:
     a1 = az + 180.0
     return {"surface_azimuths_deg": [a0, a1], "panels_per_azimuth": [n1, n2]}
 
-
+@app.get("/debug/openmeteo_az")
+def debug_openmeteo_az(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    tilt: float = Query(25.0),
+    year: int = Query(2025),
+):
+    return debug_compare_openmeteo_azimuth_conventions(
+        latitude=lat,
+        longitude=lon,
+        tilt_deg=tilt,
+        year=year,
+    )
 
 @app.post("/simulate")
 def simulate(req: SimRequest) -> Dict[str, Any]:
@@ -336,6 +377,24 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
     annual = float(base.get("annual_energy_kwh") or 0.0)
     mean_poa = float(base.get("mean_poa_w_m2") or 0.0)
 
+    pv_shaded: Dict[str, Any] = {}
+    tau_pv_mean = 1.0
+
+    if req.pv_shading_samples:
+        # Normalize samples for sim_core: always provide "tau" as the factor to apply.
+        pv_samples = []
+        for s in (req.pv_shading_samples or []):
+            d = s.model_dump()
+            d["tau"] = max(0.0, min(1.0, float(s.pv_factor())))
+            pv_samples.append(d)
+
+        pv_shaded = pv_energy_from_tau_samples(
+            base=base,
+            pv_samples=pv_samples,
+        )
+        tau_pv_mean = float((pv_shaded or {}).get("tau_pv_mean", 1.0) or 1.0)
+
+
     # Compute weighted mean transmittance tau from samples.
     # If no samples, fall back to tau=1.0 (no additional shading).
     if req.shading_samples:
@@ -346,15 +405,15 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
             t = float(s.tau)
             wsum += w
             tsum += w * t
-        tau_mean = (tsum / wsum) if wsum > 0 else 1.0
+        tau_water_mean = (tsum / wsum) if wsum > 0 else 1.0
     else:
-        tau_mean = 1.0
+        tau_water_mean = 1.0
 
     # Effective factor: combine sky-view factor and beam transmittance proxy.
     # This is a simplified model; you can refine later.
     svf = float(req.svf)
-    effective = max(0.0, min(1.0, svf * tau_mean))
-
+    effective = max(0.0, min(1.0, svf * tau_water_mean))
+    
     # Water-plane metrics expected by the frontend
     year_int = int(req.year) if req.year is not None else None
     # Default to 2024 if year not provided (last full year), keeps results deterministic.
@@ -421,10 +480,26 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
     water_saved_lpy = max(0.0, evap_uncovered_lpy - evap_covered_lpy)
     water_saved_pct = 0.0 if evap_uncovered_lpy <= 1e-9 else (100.0 * water_saved_lpy / evap_uncovered_lpy)
 
+    ann_shaded = (pv_shaded or {}).get("annual_energy_kwh_shaded_pv", annual)
+    if ann_shaded is None:
+        ann_shaded = annual
+
+    tau_pv_mean = (pv_shaded or {}).get("tau_pv_mean", 1.0)
+    if tau_pv_mean is None:
+        tau_pv_mean = 1.0
+
+
     return {
         # PV energy/POA should come from the PV model (base) and should not be scaled by water SVF/tau.
         "annual_energy_kwh": annual,
         "mean_poa_w_m2": mean_poa,
+        "annual_energy_kwh_shaded_pv": float(ann_shaded),
+        "monthly_energy_kwh_shaded_pv": pv_shaded.get("monthly_energy_kwh_shaded_pv", base.get("monthly_energy_kwh", {})),
+        "pv_shading": {
+            "tau_pv_mean": float(tau_pv_mean),
+            "tau_pv_monthly": pv_shaded.get("tau_pv_monthly", {}),
+            "n_pv_samples": len(req.pv_shading_samples or []),
+        },
 
         # Water metrics used for savings scaling in water mode
         "water_baseline_kwh_m2": float(wm.get("water_baseline_kwh_m2", 0.0)),
@@ -453,11 +528,46 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
         # Debug shading fields
         "shading": {
             "svf": svf,
-            "tau_mean": tau_mean,
+            "tau_mean": float(tau_water_mean),
             "effective_factor": effective,
             "n_samples": len(req.shading_samples),
             "svf_n_rays": req.svf_n_rays,
             "svf_scheme": req.svf_scheme,
         },
         "details": base,
+    }
+
+@app.post("/rainwater_annual")
+def rainwater_annual(req: SimRequest) -> Dict[str, Any]:
+    """Annual rainwater collection estimate for Solar Waves (V1: last calendar year).
+
+    This endpoint is intentionally separate from /simulate and /simulate_shaded so that
+    existing simulation functions and payloads remain untouched.
+    """
+    _ensure_sim_core()
+
+    if (req.array_type or "").lower() != "waves":
+        return {
+            "enabled": False,
+            "reason": "rainwater metric is only implemented for array_type='waves'",
+        }
+
+    year = int(dt.datetime.utcnow().year) - 1
+
+    out = annual_rainwater_collection(
+        latitude=float(req.lat),
+        longitude=float(req.lon),
+        year=year,
+        total_panels=int(req.total_panels),
+        panel_width_m=float(req.panel_width_m),
+        panel_height_m=float(req.panel_height_m),
+        tilt_deg=float(req.tilt_deg),
+        eta=0.80,
+        coverage=1.00,
+    )
+
+    return {
+        "enabled": True,
+        "year": year,
+        **out,
     }
