@@ -564,6 +564,143 @@ def simulate_annual_output(
         "mean_poa_w_m2": float(mean_poa_w_m2),
     }
 
+def validate_base_array_simulation(
+    *,
+    latitude: float,
+    longitude: float,
+    surface_tilt_deg: float,
+    surface_azimuths_deg: Sequence[float],
+    panels_per_azimuth: Sequence[int],
+    panel_area_m2: float,
+    eff_stc: float,
+    noct: float,
+    temp_coeff: float,
+    cooling_offset: float,
+) -> Dict[str, Any]:
+    """Validate base array simulation for potential flaws."""
+    
+    diagnostics = {
+        "inputs_validated": True,
+        "warnings": [],
+        "errors": [],
+        "sanity_checks": {},
+        "expected_ranges": {},
+        "edge_cases": [],
+        "suggestions": []
+    }
+    
+    # 1. Input Validation
+    if not (-90 <= latitude <= 90):
+        diagnostics["errors"].append(f"Invalid latitude: {latitude}")
+        diagnostics["inputs_validated"] = False
+    
+    if not (-180 <= longitude <= 180):
+        diagnostics["errors"].append(f"Invalid longitude: {longitude}")
+        diagnostics["inputs_validated"] = False
+    
+    if not (0 <= surface_tilt_deg <= 90):
+        diagnostics["warnings"].append(f"Unusual tilt angle: {surface_tilt_deg}° (typical range 0-90°)")
+   
+    if not (0 <= sum(panels_per_azimuth) <= 10000):
+        diagnostics["warnings"].append(f"Unusual panel count: {sum(panels_per_azimuth)}")
+    
+    if not (0.5 <= panel_area_m2 <= 5.0):
+        diagnostics["warnings"].append(f"Unusual panel area: {panel_area_m2} m² (typical 1.0-2.5 m²)")
+    
+    if not (0.05 <= eff_stc <= 0.30):
+        diagnostics["warnings"].append(f"Unusual STC efficiency: {eff_stc} (typical 0.15-0.25)")
+    
+    if not (30 <= noct <= 60):
+        diagnostics["warnings"].append(f"Unusual NOCT: {noct}°C (typical 40-50°C)")
+    
+    if not (-0.01 >= temp_coeff >= -0.002):
+        diagnostics["warnings"].append(f"Unusual temperature coefficient: {temp_coeff} (typical -0.005 to -0.003)")
+    
+    # 2. Orientation Balance Check
+    if len(surface_azimuths_deg) == 2:
+        az1, az2 = surface_azimuths_deg
+        diff = (az2 - az1) % 360
+        if not (175 <= diff <= 185):
+            diagnostics["warnings"].append(
+                f"Waves array orientations not opposing: {az1:.1f}° vs {az2:.1f}° (diff {diff:.1f}°)"
+            )
+    
+    # 3. Panel Distribution Check
+    total_panels = sum(panels_per_azimuth)
+    if total_panels == 0:
+        diagnostics["errors"].append("Zero total panels")
+        diagnostics["inputs_validated"] = False
+    else:
+        for i, n in enumerate(panels_per_azimuth):
+            if n < 0:
+                diagnostics["errors"].append(f"Negative panel count for orientation {i}")
+                diagnostics["inputs_validated"] = False
+    
+    # 4. Fetch small sample to validate Open-Meteo connectivity
+    try:
+        test_ts = _fetch_tilted_timeseries(
+            latitude=latitude,
+            longitude=longitude,
+            tilt_deg=surface_tilt_deg,
+            azimuth_deg=_normalize_azimuth_deg(float(surface_azimuths_deg[0])),
+            year=2024,
+        )
+        
+        if test_ts.count > 0:
+            max_poa = max(test_ts.poa_w_m2)
+            mean_poa = test_ts.total_poa_sum_wm2 / test_ts.count
+            
+            diagnostics["sanity_checks"]["openmeteo_data_available"] = True
+            diagnostics["sanity_checks"]["max_poa_w_m2"] = float(max_poa)
+            diagnostics["sanity_checks"]["mean_poa_w_m2"] = float(mean_poa)
+            diagnostics["sanity_checks"]["data_points"] = test_ts.count
+            
+            if max_poa > 1500:
+                diagnostics["warnings"].append(f"Suspiciously high POA: {max_poa:.0f} W/m²")
+            if mean_poa < 50:
+                diagnostics["warnings"].append(f"Very low mean POA: {mean_poa:.0f} W/m² (possible polar night/latitude issue)")
+            
+        else:
+            diagnostics["errors"].append("No data returned from Open-Meteo")
+            diagnostics["sanity_checks"]["openmeteo_data_available"] = False
+            
+    except Exception as e:
+        diagnostics["errors"].append(f"Open-Meteo connection failed: {str(e)}")
+        diagnostics["sanity_checks"]["openmeteo_data_available"] = False
+    
+    # 5. Expected Ranges for Outputs
+    diagnostics["expected_ranges"] = {
+        "annual_energy_kwh_per_panel": {
+            "min": 150,
+            "max": 800,
+            "typical": "300-500"
+        },
+        "mean_poa_w_m2": {
+            "min": 100,
+            "max": 400,
+            "typical": "200-350"
+        }
+    }
+    
+    # 6. Edge Cases Detection
+    if abs(latitude) > 66.5:
+        diagnostics["edge_cases"].append("Polar region - seasonal extremes expected")
+    
+    if surface_tilt_deg > 80:
+        diagnostics["edge_cases"].append("Near-vertical array - unusual mounting")
+    
+    if total_panels < 5:
+        diagnostics["edge_cases"].append("Very small array - statistics may be noisy")
+    
+    # 7. Suggestions
+    if diagnostics["warnings"]:
+        diagnostics["suggestions"].append("Review warnings before scaling results")
+    
+    if diagnostics["errors"]:
+        diagnostics["suggestions"].append("Fix errors in base configuration")
+    
+    return diagnostics
+
 def _parse_month_key_from_time_utc(time_utc: str) -> str | None:
     if not time_utc or len(time_utc) < 7:
         return None
@@ -823,6 +960,8 @@ def water_metrics_from_shading_samples(
     year: int,
     samples: Sequence[dict],
     svf: float = 1.0,
+    elevation_m: float = 0.6,
+    copy_multiplier: int = 1,
 ) -> Dict[str, float]:
     """Estimate annual shortwave energy on water for baseline vs shaded cases.
 
@@ -942,6 +1081,10 @@ def water_metrics_from_shading_samples(
         i1 = float(dni) * cosz * tau + float(dhi) * svf_clamped
         baseline += i0 * wh / 1000.0
         shaded += i1 * wh / 1000.0
+
+    # Apply copy multiplier to final results
+    baseline = baseline * copy_multiplier
+    shaded = shaded * copy_multiplier    
 
     red = 0.0 if baseline <= 1e-9 else max(0.0, min(100.0, 100.0 * (1.0 - shaded / baseline)))
     return {

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sim_core import pv_energy_from_tau_samples
+from sim_core import pv_energy_from_tau_samples, validate_base_array_simulation
 import requests
 from sim_core import debug_compare_openmeteo_azimuth_conventions
 from fastapi import Query
@@ -51,6 +51,7 @@ except Exception as e:  # pragma: no cover
     get_meteo_timeseries = None  # type: ignore
     annual_climate_means = None  # type: ignore
     infer_wind_block_factor = None  # type: ignore
+    validate_base_array_simulation = None  # type: ignore
     water_evaporation_lpy_from_kwh_m2 = None  # type: ignore
     annual_rainwater_collection = None  # type: ignore
     _SIM_IMPORT_ERROR = str(e)
@@ -98,6 +99,9 @@ class ShadingSample(BaseModel):
     # New frontend fields (optional)
     tau_shadow: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     f_beam: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+    # Copy multiplier for scaling
+    copy_multiplier: Optional[int] = Field(default=1, ge=1)
 
     weight_hours: float = Field(gt=0.0)
 
@@ -203,7 +207,6 @@ def _ensure_sim_core() -> None:
 def _compute_panel_area_m2(req: SimRequest) -> float:
     return float(req.panel_width_m) * float(req.panel_height_m)
 
-
 def _compute_orientation_buckets(req: SimRequest) -> Dict[str, Any]:
     """Map frontend array_type to (surface_azimuths_deg, panels_per_azimuth).
 
@@ -236,19 +239,28 @@ def _compute_orientation_buckets(req: SimRequest) -> Dict[str, Any]:
     a1 = az + 180.0
     return {"surface_azimuths_deg": [a0, a1], "panels_per_azimuth": [n1, n2]}
 
-@app.get("/debug/openmeteo_az")
-def debug_openmeteo_az(
-    lat: float = Query(...),
-    lon: float = Query(...),
-    tilt: float = Query(25.0),
-    year: int = Query(2025),
-):
-    return debug_compare_openmeteo_azimuth_conventions(
-        latitude=lat,
-        longitude=lon,
-        tilt_deg=tilt,
-        year=year,
+
+@app.post("/validate_base_array")
+def validate_base_array(req: SimRequest) -> Dict[str, Any]:
+    """Validate base array configuration for potential simulation flaws."""
+    _ensure_sim_core()
+    
+    buckets = _compute_orientation_buckets(req)
+    
+    diagnostics = validate_base_array_simulation(
+        latitude=float(req.lat),
+        longitude=float(req.lon),
+        surface_tilt_deg=float(req.tilt_deg),
+        surface_azimuths_deg=buckets["surface_azimuths_deg"],
+        panels_per_azimuth=buckets["panels_per_azimuth"],
+        panel_area_m2=_compute_panel_area_m2(req),
+        eff_stc=float(req.eff_stc) if req.eff_stc is not None else 0.20,
+        noct=float(req.noct) if req.noct is not None else 45.0,
+        temp_coeff=float(req.temp_coeff) if req.temp_coeff is not None else -0.0035,
+        cooling_offset=float(req.cooling_offset) if req.cooling_offset is not None else 0.0,
     )
+    
+    return diagnostics
 
 @app.post("/simulate")
 def simulate(req: SimRequest) -> Dict[str, Any]:
@@ -278,8 +290,6 @@ def simulate(req: SimRequest) -> Dict[str, Any]:
         "mean_poa_w_m2": out.get("mean_poa_w_m2"),
         "details": out,
     }
-
-
 
 @app.post("/simulate_snapshot_day")
 def simulate_snapshot_day(req: SimRequest) -> Dict[str, Any]:
@@ -417,6 +427,7 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
     # Water-plane metrics expected by the frontend
     year_int = int(req.year) if req.year is not None else None
     # Default to 2024 if year not provided (last full year), keeps results deterministic.
+    copy_multiplier = int(req.copy_multiplier) if hasattr(req, 'copy_multiplier') else 1
     if year_int is None:
         year_int = 2024
 
@@ -426,6 +437,8 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
         year=year_int,
         samples=[s.model_dump() for s in (req.shading_samples or [])],
         svf=svf,
+        elevation_m=float(req.height_m) if req.height_m is not None else 0.6,
+        copy_multiplier=copy_multiplier,
     )
 
     # --- Ladybug-aligned evaporation model (liters/year) ---
@@ -474,6 +487,9 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
         use_penman=use_penman,
         wind_block_factor=wind_factor_covered,
     )
+
+    # Scale water area by copy multiplier
+    water_area_m2 = water_area_m2 * copy_multiplier
 
     evap_uncovered_lpy = float(evap_uncovered.get("evap_lpy_wind", 0.0))
     evap_covered_lpy = float(evap_covered.get("evap_lpy_wind", 0.0))
