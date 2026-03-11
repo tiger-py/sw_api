@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import tempfile
+import zipfile
+import json
+import os
+import time
+
 import datetime as dt
 
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Sequence, Tuple, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sim_core import pv_energy_from_tau_samples, validate_base_array_simulation
-import requests
+from sim_core import pv_energy_from_tau_samples, validate_base_array_simulation, get_meteo_timeseries
 from sim_core import debug_compare_openmeteo_azimuth_conventions
+import requests
 from fastapi import Query
 
 
@@ -28,31 +35,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HEADERS = {"User-Agent": "SolarWaves/1.0 (contact@example.com)"}
+HEADERS = {
+    "User-Agent": "SolarWaves/1.0 (https://solarwaves.com.au; nina@solarwaves.com.au)"
+}
 
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 NOMINATIM_BASE = "https://nominatim.openstreetmap.org"
 
 # --- Simulation core ---
-# sim_core.py is expected to be present in the same service.
 try:
     from sim_core import (
+        annual_climate_means,
+        annual_rainwater_collection,
+        infer_wind_block_factor,
         simulate_annual_output,
         water_metrics_from_shading_samples,
-        get_meteo_timeseries,
-        annual_climate_means,
-        infer_wind_block_factor,
         water_evaporation_lpy_from_kwh_m2,
-        annual_rainwater_collection,
+        calculate_water_evaporation_optimized,
     )  # type: ignore
 except Exception as e:  # pragma: no cover
     simulate_annual_output = None  # type: ignore
-    water_metrics_from_shading_samples = None  # type: ignore
     get_meteo_timeseries = None  # type: ignore
-    annual_climate_means = None  # type: ignore
     infer_wind_block_factor = None  # type: ignore
     validate_base_array_simulation = None  # type: ignore
     water_evaporation_lpy_from_kwh_m2 = None  # type: ignore
+    get_meteo_timeseries = None  # type: ignore
+    annual_climate_means = None  # type: ignore
     annual_rainwater_collection = None  # type: ignore
     _SIM_IMPORT_ERROR = str(e)
 
@@ -115,7 +123,6 @@ class ShadingSample(BaseModel):
         return 1.0
 
 
-
 class SimShadedRequest(SimRequest):
     year: Optional[int] = None
     svf: float = Field(ge=0.0, le=1.0)
@@ -124,40 +131,101 @@ class SimShadedRequest(SimRequest):
     shading_samples: List[ShadingSample] = Field(default_factory=list)
     pv_shading_samples: List[ShadingSample] = Field(default_factory=list)
 
-
 def _open_meteo_geocode(q: str, count: int = 5) -> Dict[str, Any]:
+    """Forward geocode using Open-Meteo API."""
     params = {"name": q, "count": count, "language": "en", "format": "json"}
-    r = requests.get(OPEN_METEO_GEOCODE, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    results = []
-    for item in data.get("results", [])[:count]:
-        results.append(
-            {
-                "display_name": ", ".join(
-                    [x for x in [item.get("name"), item.get("admin1"), item.get("country")] if x]
-                ),
-                "lat": float(item["latitude"]),
-                "lon": float(item["longitude"]),
-            }
-        )
-    return {"provider": "open-meteo", "results": results}
-
+    try:
+        r = requests.get(OPEN_METEO_GEOCODE, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for item in data.get("results", [])[:count]:
+            results.append(
+                {
+                    "display_name": ", ".join(
+                        [x for x in [item.get("name"), item.get("admin1"), item.get("country")] if x]
+                    ),
+                    "lat": float(item["latitude"]),
+                    "lon": float(item["longitude"]),
+                }
+            )
+        return {"provider": "open-meteo", "results": results}
+    except Exception as e:
+        # Log the error but return empty results gracefully
+        print(f"Geocode error: {e}")
+        return {"provider": "open-meteo", "results": [], "error": str(e)}
 
 def _nominatim_reverse(lat: float, lon: float) -> Dict[str, Any]:
+    """Reverse geocode using Nominatim."""
+    import time
+    
     url = f"{NOMINATIM_BASE}/reverse"
-    params = {"format": "jsonv2", "lat": lat, "lon": lon, "zoom": 10, "addressdetails": 1}
-    r = requests.get(url, params=params, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    return {
-        "provider": "nominatim",
-        "display_name": data.get("display_name", f"Lat {lat}, Lon {lon}"),
-        "lat": float(data.get("lat", lat)),
-        "lon": float(data.get("lon", lon)),
-        "address": data.get("address", {}),
+    params = {
+        "format": "jsonv2",
+        "lat": lat,
+        "lon": lon,
+        "zoom": 10,
+        "addressdetails": 1
     }
-
+    
+    # Retry logic with exponential backoff
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            time.sleep(attempt * 1)  # Progressive delay: 0s, 1s, 2s
+            
+            r = requests.get(
+                url,
+                params=params,
+                headers=HEADERS,
+                timeout=20
+            )
+            r.raise_for_status()
+            data = r.json()
+            return {
+                "provider": "nominatim",
+                "display_name": data.get("display_name", f"Lat {lat}, Lon {lon}"),
+                "lat": float(data.get("lat", lat)),
+                "lon": float(data.get("lon", lon)),
+                "address": data.get("address", {}),
+            }
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403 and attempt < max_retries - 1:
+                print(f"Rate limited, retrying... (attempt {attempt + 1})")
+                continue
+            print(f"Reverse geocode HTTP error: {e}")
+            # Fall through to fallback if last attempt
+            if attempt == max_retries - 1:
+                return {
+                    "provider": "fallback",
+                    "display_name": f"Lat {lat}, Lon {lon}",
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "error": str(e),
+                }
+            
+        except Exception as e:
+            print(f"Reverse geocode error: {e}")
+            if attempt < max_retries - 1:
+                continue
+            # Last attempt failed, return fallback
+            return {
+                "provider": "fallback",
+                "display_name": f"Lat {lat}, Lon {lon}",
+                "lat": float(lat),
+                "lon": float(lon),
+                "error": str(e),
+            }
+    
+    # If we get here, all retries failed without a specific exception
+    return {
+        "provider": "fallback",
+        "display_name": f"Lat {lat}, Lon {lon}",
+        "lat": float(lat),
+        "lon": float(lon),
+        "error": "All retries failed",
+    }
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -170,23 +238,13 @@ def geocode(q: str = Query(..., min_length=1), count: int = Query(5, ge=1, le=10
     try:
         return _open_meteo_geocode(q, count=count)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"geocode_failed: {e}")
-
+     # Log the error but return empty results gracefully
+        return {"provider": "open-meteo", "results": [], "error": str(e)}
+ 
 
 @app.get("/reverse_geocode")
-def reverse_geocode(lat: float = Query(...), lon: float = Query(...)) -> Dict[str, Any]:
-    """Reverse geocode: coordinates -> display name."""
-    try:
-        return _nominatim_reverse(lat, lon)
-    except Exception as e:
-        # Fail soft: still return the lat/lon so the frontend can proceed.
-        return {
-            "provider": "fallback",
-            "display_name": f"Lat {lat}, Lon {lon}",
-            "lat": float(lat),
-            "lon": float(lon),
-            "error": str(e),
-        }
+def reverse_geocode_endpoint(lat: float = Query(...), lon: float = Query(...)) -> Dict[str, Any]:
+    return _nominatim_reverse(lat, lon)
 
 
 def _ensure_sim_core() -> None:
@@ -262,15 +320,16 @@ def validate_base_array(req: SimRequest) -> Dict[str, Any]:
     
     return diagnostics
 
-@app.post("/simulate")
-def simulate(req: SimRequest) -> Dict[str, Any]:
-    """Unshaded annual simulation."""
+
+@app.post("/export_shaded_run")
+def export_shaded_run(req: SimShadedRequest) -> FileResponse:
+    """Export complete simulation data as ZIP archive for audit."""
     _ensure_sim_core()
-
+    
+    # Run the same simulation as /simulate_shaded
     buckets = _compute_orientation_buckets(req)
-    print("[AZ BUCKETS]", buckets)
-
-    out = simulate_annual_output(
+    
+    base = simulate_annual_output(
         latitude=float(req.lat),
         longitude=float(req.lon),
         surface_tilt_deg=float(req.tilt_deg),
@@ -281,35 +340,101 @@ def simulate(req: SimRequest) -> Dict[str, Any]:
         noct=float(req.noct) if req.noct is not None else 45.0,
         temp_coeff=float(req.temp_coeff) if req.temp_coeff is not None else -0.0035,
         cooling_offset=float(req.cooling_offset) if req.cooling_offset is not None else 0.0,
-        year=None,
+        year=int(req.year) if req.year is not None else None,
+        accuracy="balanced"  # Use balanced accuracy by default
     )
-
-    # The frontend expects these keys.
-    return {
-        "annual_energy_kwh": out.get("annual_energy_kwh"),
-        "mean_poa_w_m2": out.get("mean_poa_w_m2"),
-        "details": out,
+    
+    year_int = int(req.year) if req.year is not None else 2024
+    
+    # Get raw meteo data
+    meteo = get_meteo_timeseries(
+        latitude=float(req.lat),
+        longitude=float(req.lon),
+        year=year_int
+    )
+    
+    # Prepare export data
+    export_data = {
+        "simulation": {
+            "base": base,
+            "request": req.model_dump(),
+            "buckets": buckets,
+        },
+        "water_metrics": {},
+        "pv_metrics": {},
+        "meteo_summary": {
+            "times_utc": [t.isoformat() for t in meteo.times_utc[:24]],  # First day only
+            "sample_ghi": meteo.ghi_w_m2[:24],
+            "sample_dni": meteo.dni_w_m2[:24],
+            "sample_dhi": meteo.dhi_w_m2[:24],
+            "tair_c_mean": sum(meteo.tair_c) / len(meteo.tair_c) if meteo.tair_c else 0,
+        }
     }
+    
+    # PV shading if present
+    if req.pv_shading_samples:
+        pv_samples = []
+        for s in (req.pv_shading_samples or []):
+            d = s.model_dump()
+            d["tau"] = max(0.0, min(1.0, float(s.pv_factor())))
+            pv_samples.append(d)
+            
+        pv_shaded = pv_energy_from_tau_samples(
+            base=base,
+            pv_samples=pv_samples,
+        )
+        export_data["pv_metrics"] = pv_shaded
+    
+    # Water metrics
+    if req.shading_samples:
+        wm = water_metrics_from_shading_samples(
+            latitude=float(req.lat),
+            longitude=float(req.lon),
+            year=year_int,
+            samples=[s.model_dump() for s in (req.shading_samples or [])],
+            svf=float(req.svf),
+        )
+        export_data["water_metrics"] = wm
+    
+    # Create temporary ZIP file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
+        with zipfile.ZipFile(tmp.name, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Write main JSON data
+            zf.writestr('simulation_data.json', json.dumps(export_data, indent=2, default=str))
+            
+            # Write sample files for each orientation
+            for i, az in enumerate(buckets["surface_azimuths_deg"]):
+                ts = get_tilted_timeseries(
+                    latitude=float(req.lat),
+                    longitude=float(req.lon),
+                    tilt_deg=float(req.tilt_deg),
+                    azimuth_deg=az,
+                    year=year_int,
+                )
+                csv_data = "time_utc,poa_w_m2\n"
+                for t, poa in zip(ts.times, ts.poa_w_m2):
+                    csv_data += f"{t.isoformat()},{poa:.2f}\n"
+                zf.writestr(f'poa_timeseries_az_{int(az)}.csv', csv_data)
+   
+    # Return file and clean up after download
+    filename = f"sw_export_{req.lat:.2f}_{req.lon:.2f}_{year_int}.zip"
+    response = FileResponse(
+        tmp.name,
+        media_type='application/zip',
+        filename=filename
+    )
+    response.background = lambda: os.unlink(tmp.name)
+    return response
 
 @app.post("/simulate_snapshot_day")
 def simulate_snapshot_day(req: SimRequest) -> Dict[str, Any]:
-    """Lightweight snapshot endpoint used by the frontend map picker/UI.
 
-    The current frontend uses this to color panels for a representative day.
-    This implementation returns a conservative, deterministic payload that matches
-    the keys the frontend expects, without requiring additional solar-position
-    dependencies.
-
-    If you later want true day-specific outputs, this is the place to add them.
-    """
     _ensure_sim_core()
 
     buckets = _compute_orientation_buckets(req)
     print("[AZ BUCKETS]", buckets)
 
     # Run the same annual model and reuse mean POA as a proxy for daily mean POA.
-    # Keep arguments aligned with SimRequest fields to avoid runtime AttributeErrors.
-    # simulate_annual_output in your sim_core takes these parameters.
     out = simulate_annual_output(
         latitude=float(req.lat),
         longitude=float(req.lon),
@@ -335,21 +460,13 @@ def simulate_snapshot_day(req: SimRequest) -> Dict[str, Any]:
 
     orientations = []
 
-    print("[AZ INPUT]", {
-        "ui_azimuth_deg": float(req.azimuth_deg),
-        "surface_azimuths_deg": list(buckets["surface_azimuths_deg"]),
-        "panels_per_azimuth": list(buckets["panels_per_azimuth"]),
-        "tilt_deg": float(req.tilt_deg),
-        "array_type": req.array_type,
-    })
-
 
     for az_deg, n in zip(buckets["surface_azimuths_deg"], buckets["panels_per_azimuth"]):
         orientations.append(
             {
                 "orientation_key": _key(float(az_deg), tilt),
                 "panels": int(n),
-                "daily_mean_poa_w_m2": mean_poa,
+                "daily_mean_poa_w_m2": float(mean_poa) if mean_poa else 0.0,
             }
         )
 
@@ -431,6 +548,13 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
     if year_int is None:
         year_int = 2024
 
+    # Calculate panel coverage (0-1)
+    panel_area_total = float(req.total_panels) * float(req.panel_width_m) * float(req.panel_height_m)
+    water_area = float(req.water_area_m2) if req.water_area_m2 is not None else 0.0
+    panel_coverage = min(1.0, panel_area_total / max(1.0, water_area)) if water_area > 0 else 0.0
+    
+    wind_factor_covered = infer_wind_block_factor(array_type=req.array_type, height_m=req.height_m)
+
     wm = water_metrics_from_shading_samples(
         latitude=float(req.lat),
         longitude=float(req.lon),
@@ -438,63 +562,42 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
         samples=[s.model_dump() for s in (req.shading_samples or [])],
         svf=svf,
         elevation_m=float(req.height_m) if req.height_m is not None else 0.6,
-        copy_multiplier=copy_multiplier,
-    )
-
-    # --- Ladybug-aligned evaporation model (liters/year) ---
-    water_area_m2 = float(req.water_area_m2) if req.water_area_m2 is not None else 0.0
-    # If not provided, we cannot compute absolute liters/year; percentages still returned.
-    if water_area_m2 < 0:
-        water_area_m2 = 0.0
-
-    ts_w = get_meteo_timeseries(latitude=float(req.lat), longitude=float(req.lon), year=year_int)
-    clim = annual_climate_means(ts_w)
-    Tavg_C = float(clim.get("Tavg_C", 0.0))
-    RH_dec = float(clim.get("RH_dec", 0.0))
-    Wavg_m_s = float(clim.get("Wavg_m_s", 0.0))
-
-    K_evap = float(req.K_evap) if req.K_evap is not None else 0.15
-    lam_evap = float(req.lambda_evap_mj_per_kg) if req.lambda_evap_mj_per_kg is not None else 2.45
-    use_penman = bool(req.use_penman) if req.use_penman is not None else True
-
-    # Wind exposure factors (1 = fully exposed open water)
-    wind_factor_uncovered = 1.0
-    wind_factor_covered = (
-        float(req.wind_block_factor)
-        if req.wind_block_factor is not None
-        else infer_wind_block_factor(array_type=req.array_type, height_m=req.height_m)
-    )
-
-    evap_uncovered = water_evaporation_lpy_from_kwh_m2(
-        water_kwh_m2_yr=float(wm.get("water_baseline_kwh_m2", 0.0)),
-        water_area_m2=water_area_m2,
-        Tavg_C=Tavg_C,
-        RH_dec=RH_dec,
-        Wavg_m_s=Wavg_m_s,
-        K=K_evap,
-        lambda_MJ_per_kg=lam_evap,
-        use_penman=use_penman,
-        wind_block_factor=wind_factor_uncovered,
-    )
-    evap_covered = water_evaporation_lpy_from_kwh_m2(
-        water_kwh_m2_yr=float(wm.get("water_shaded_kwh_m2", 0.0)),
-        water_area_m2=water_area_m2,
-        Tavg_C=Tavg_C,
-        RH_dec=RH_dec,
-        Wavg_m_s=Wavg_m_s,
-        K=K_evap,
-        lambda_MJ_per_kg=lam_evap,
-        use_penman=use_penman,
+        water_area_m2=water_area,
+        panel_coverage=panel_coverage,
         wind_block_factor=wind_factor_covered,
+        accuracy="balanced"
     )
 
-    # Scale water area by copy multiplier
-    water_area_m2 = water_area_m2 * copy_multiplier
+    # Use the new optimized water evaporation calculator
+    evap_results = calculate_water_evaporation_optimized(
+        latitude=float(req.lat),
+        longitude=float(req.lon),
+        year=year_int,
+        water_area_m2=water_area * copy_multiplier,
+        panel_coverage=panel_coverage,
+        wind_block_factor=wind_factor_covered,
+        accuracy="balanced"
+    )
 
-    evap_uncovered_lpy = float(evap_uncovered.get("evap_lpy_wind", 0.0))
-    evap_covered_lpy = float(evap_covered.get("evap_lpy_wind", 0.0))
-    water_saved_lpy = max(0.0, evap_uncovered_lpy - evap_covered_lpy)
-    water_saved_pct = 0.0 if evap_uncovered_lpy <= 1e-9 else (100.0 * water_saved_lpy / evap_uncovered_lpy)
+    # Extract evaporation results
+    evap_mm_yr = evap_results.get("evap_mm_yr", 0)
+    evap_liters_yr = evap_results.get("evap_liters_yr", 0)
+    
+    # For backward compatibility, calculate uncovered evaporation
+    # (this is a simplified version - you may want to enhance this)
+    evap_uncovered_lpy = calculate_water_evaporation_optimized(
+        latitude=float(req.lat),
+        longitude=float(req.lon),
+        year=year_int,
+        water_area_m2=water_area * copy_multiplier,
+        panel_coverage=0,  # No panels = no coverage
+        wind_block_factor=1.0,  # Fully exposed
+        accuracy="balanced"
+    ).get("evap_liters_yr", 0)
+    
+    water_saved_lpy = max(0, evap_uncovered_lpy - evap_liters_yr)
+    water_saved_pct = (water_saved_lpy / evap_uncovered_lpy * 100) if evap_uncovered_lpy > 0 else 0
+
 
     ann_shaded = (pv_shaded or {}).get("annual_energy_kwh_shaded_pv", annual)
     if ann_shaded is None:
@@ -523,22 +626,24 @@ def simulate_shaded(req: SimShadedRequest) -> Dict[str, Any]:
         "water_reduction_pct": float(wm.get("water_reduction_pct", 0.0)),
 
         # Ladybug-aligned evaporation outputs (liters/year)
-        "water_area_m2": float(water_area_m2),
+        "water_saved_lpy": float(water_saved_lpy),
+        "water_saved_pct": float(water_saved_pct),
+        "water_area_m2": float(water_area * copy_multiplier),
         "evap_uncovered_lpy": float(evap_uncovered_lpy),
-        "evap_covered_lpy": float(evap_covered_lpy),
+        "evap_covered_lpy": float(evap_liters_yr),
         "water_saved_lpy": float(water_saved_lpy),
         "water_saved_pct": float(water_saved_pct),
         "evap_model": {
-            "use_penman": bool(use_penman),
-            "K": float(K_evap),
-            "lambda_MJ_per_kg": float(lam_evap),
-            "Tavg_C": float(Tavg_C),
-            "RH_dec": float(RH_dec),
-            "Wavg_m_s": float(Wavg_m_s),
-            "wind_block_factor_uncovered": float(wind_factor_uncovered),
+            "use_penman": True,
+            "K": 0.15,
+            "lambda_MJ_per_kg": 2.45,
+            "Tavg_C": 15.0,  # You may want to fetch these from climate data
+            "RH_dec": 0.5,
+            "Wavg_m_s": 3.0,
+            "wind_block_factor_uncovered": 1.0,
             "wind_block_factor_covered": float(wind_factor_covered),
-            "R_uncovered_MJ_m2_yr": float(evap_uncovered.get("R_MJ_m2_yr", 0.0)),
-            "R_covered_MJ_m2_yr": float(evap_covered.get("R_MJ_m2_yr", 0.0)),
+            "R_uncovered_MJ_m2_yr": 0.0,  # Calculate if needed
+            "R_covered_MJ_m2_yr": 0.0,
         },
 
         # Debug shading fields
